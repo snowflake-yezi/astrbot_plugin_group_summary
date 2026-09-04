@@ -1,0 +1,5 @@
+name: group_summary
+description: 记录群消息，并生成当天或指定日期的群聊分析日报。
+author: yz
+version: 1.0.1
+repo: https://github.com/snowflake-yezi/astrbot_plugin_group_summary
