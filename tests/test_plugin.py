@@ -13,6 +13,16 @@ def install_astrbot_stubs() -> None:
     api = types.ModuleType("astrbot.api")
     event_module = types.ModuleType("astrbot.api.event")
     star_module = types.ModuleType("astrbot.api.star")
+    components_module = types.ModuleType("astrbot.api.message_components")
+
+    class At:
+        def __init__(self, qq, name=""):
+            self.qq = qq
+            self.name = name
+
+    class Plain:
+        def __init__(self, text):
+            self.text = text
 
     class Logger:
         def warning(self, *args, **kwargs) -> None:
@@ -45,11 +55,14 @@ def install_astrbot_stubs() -> None:
     event_module.filter = Filters
     star_module.Context = Context
     star_module.Star = Star
+    components_module.At = At
+    components_module.Plain = Plain
     astrbot.api = api
     sys.modules.setdefault("astrbot", astrbot)
     sys.modules.setdefault("astrbot.api", api)
     sys.modules.setdefault("astrbot.api.event", event_module)
     sys.modules.setdefault("astrbot.api.star", star_module)
+    sys.modules.setdefault("astrbot.api.message_components", components_module)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -113,12 +126,19 @@ class FakeHistoryManager:
     def __init__(self, rows=None) -> None:
         self.rows = rows or []
         self.inserted = []
+        self.scoped_rows = {}
 
     async def insert(self, **kwargs):
         self.inserted.append(kwargs)
+        key = (kwargs["platform_id"], kwargs["user_id"])
+        if "personal_index" in kwargs["user_id"]:
+            self.scoped_rows[key] = [types.SimpleNamespace(content=kwargs["content"])]
 
     async def get(self, **kwargs):
-        return self.rows if kwargs["page"] == 1 else []
+        key = (kwargs["platform_id"], kwargs["user_id"])
+        rows = self.scoped_rows.get(key, [] if "personal_index" in kwargs["user_id"] else self.rows)
+        offset = (kwargs["page"] - 1) * kwargs["page_size"]
+        return rows[offset:offset + kwargs["page_size"]]
 
 
 class FakeContext:
