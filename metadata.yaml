@@ -1,5 +1,5 @@
 name: group_summary
 description: 记录群消息，生成群聊日报、个人聊天总览和分时段聊天详情。
 author: yz
-version: 1.1.1
+version: 1.1.2
 repo: https://github.com/snowflake-yezi/astrbot_plugin_group_summary

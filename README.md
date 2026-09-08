@@ -122,10 +122,36 @@ python -B tests/benchmark_personal.py
 
 内置字体来自 Google Fonts，采用 SIL Open Font License 1.1，许可证位于 `fonts/OFL.txt`。
 
+## 代码结构
+
+代码按 `main.py`、`core/`、`features/` 分层，参考工具集插件的组织方式：
+
+| 位置 | 职责 |
+|------|------|
+| `main.py` | 创建依赖、注册 AstrBot 指令、将请求交给功能 handler |
+| `core/config.py`、`core/event.py` | 公共限制、插件资源路径和消息组件解析 |
+| `core/history.py` | 群消息记录、批量读取与数据库行转换 |
+| `core/analysis.py` | 模型选择、超时控制和分析缓存 |
+| `core/models.py`、`core/dates.py`、`core/statistics.py`、`core/text.py` | 公共数据结构、时间、统计和文本处理 |
+| `core/rendering.py` | 公共字体、换行、配色与活动图表 |
+| `features/group/` | 群聊日报，按 `handler.py`、`service.py`、`domain.py`、`models.py`、`renderer.py` 划分职责 |
+| `features/personal/` | 个人总览与时段详情；另由 `history.py` 保存和读取时段索引 |
+
+带装饰器的异步生成器入口保留在 `main.py` 的 `GroupSummaryPlugin` 类中，以兼容 AstrBot 按模块路径绑定指令的方式。功能 handler 不注册装饰器，公共模块不依赖具体功能模块。
+字体仍位于 `fonts/`，通过插件根目录定位；历史消息会话键和个人时段索引结构保持兼容，升级无需迁移现有记录。
+
 ## 本地验证
 
 测试包含日期解析、完整统计、提示词采样、模型 JSON 清洗、虚构金句过滤、个人时段划分与上下文、详情分页、重启后的时段索引、查询隔离、记录过期、并发请求、缓存失效与隔离、模型超时、批量历史读取、长文本换行、长图扩展、图片非空检查，以及群聊、私聊、无记录等插件分支。测试使用 AstrBot 接口桩，本机无需安装 AstrBot 核心包：
 
 ```powershell
 python -B -m unittest discover -s tests -v
+```
+
+开发环境可安装 `requirements-dev.txt`，使用 Ruff 统一导入和代码排版：
+
+```powershell
+python -m pip install -r requirements-dev.txt
+ruff check .
+ruff format --check .
 ```

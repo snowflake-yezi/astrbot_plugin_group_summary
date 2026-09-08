@@ -139,9 +139,11 @@ class FakeHistoryManager:
 
     async def get(self, **kwargs):
         key = (kwargs["platform_id"], kwargs["user_id"])
-        rows = self.scoped_rows.get(key, [] if "personal_index" in kwargs["user_id"] else self.rows)
+        rows = self.scoped_rows.get(
+            key, [] if "personal_index" in kwargs["user_id"] else self.rows
+        )
         offset = (kwargs["page"] - 1) * kwargs["page_size"]
-        return rows[offset:offset + kwargs["page_size"]]
+        return rows[offset : offset + kwargs["page_size"]]
 
 
 class FakeContext:
@@ -153,16 +155,18 @@ class FakeContext:
 
 
 class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_summary_command_is_not_recorded_when_outline_contains_at(self) -> None:
+    async def test_summary_command_is_not_recorded_when_outline_contains_at(
+        self,
+    ) -> None:
         context = FakeContext()
         plugin = GroupSummaryPlugin(context)
-        await plugin._store_message(FakeEvent("群聊总结"))
+        await plugin.history.store(FakeEvent("群聊总结"))
         self.assertEqual(context.message_history_manager.inserted, [])
 
     async def test_regular_group_message_is_recorded_with_retention_limit(self) -> None:
         context = FakeContext()
         plugin = GroupSummaryPlugin(context)
-        await plugin._store_message(FakeEvent("普通消息"))
+        await plugin.history.store(FakeEvent("普通消息"))
         self.assertEqual(len(context.message_history_manager.inserted), 1)
         inserted = context.message_history_manager.inserted[0]
         self.assertEqual(inserted["max_messages"], 20_000)
@@ -171,7 +175,7 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_private_message_is_not_recorded(self) -> None:
         context = FakeContext()
         plugin = GroupSummaryPlugin(context)
-        await plugin._store_message(FakeEvent("普通消息", group_id=""))
+        await plugin.history.store(FakeEvent("普通消息", group_id=""))
         self.assertEqual(context.message_history_manager.inserted, [])
 
     async def test_no_history_returns_explanatory_fallback_without_model(self) -> None:
