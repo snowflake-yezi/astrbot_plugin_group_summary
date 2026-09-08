@@ -156,6 +156,8 @@ def _sample(messages: tuple[ChatMessage, ...], limit: int) -> list[ChatMessage]:
 
 def build_personal_prompt(report: PersonalReport) -> str:
     periods = []
+    speaker_ids: dict[tuple[str, str], str] = {}
+    members: dict[str, dict[str, str]] = {}
     # Bound every period independently so busy early periods cannot starve later ones.
     per_period = max(4, (40 if report.detailed else 60) // len(report.periods))
     for index, period in enumerate(report.periods, 1):
@@ -167,13 +169,19 @@ def build_personal_prompt(report: PersonalReport) -> str:
             + [(message, "目标成员时段外发言" if message.sender_id == report.target_id else "群内邻近发言") for message in context],
             key=lambda item: (item[0].created_at, item[0].message_id),
         ):
-            transcript.append({
-                "role": role,
-                "sender_id": _clean_text(message.sender_id, 80),
-                "name": _clean_text(message.sender_name, 40),
-                "time": dt.datetime.fromtimestamp(message.created_at).strftime("%Y-%m-%d %H:%M:%S"),
-                "text": _clean_text(message.text, 240 if report.detailed else 100),
-            })
+            identity = (message.sender_id, message.sender_name)
+            if identity not in speaker_ids:
+                speaker = str(len(speaker_ids) + 1)
+                speaker_ids[identity] = speaker
+                members[speaker] = {
+                    "sender_id": _clean_text(message.sender_id, 80),
+                    "name": _clean_text(message.sender_name, 40),
+                }
+            transcript.append([
+                role, speaker_ids[identity],
+                dt.datetime.fromtimestamp(message.created_at).strftime("%Y-%m-%d %H:%M:%S"),
+                _clean_text(message.text, 240 if report.detailed else 100),
+            ])
         periods.append({
             "id": index, "time": time_range(period.start, period.end),
             "target_count": len(period.messages), "context_count": len(period.context),
@@ -182,10 +190,11 @@ def build_personal_prompt(report: PersonalReport) -> str:
     data = {
         "target_id": _clean_text(report.target_id, 80), "target_name": _clean_text(report.target_name, 40),
         "mode": report.mode, "target_count": len(report.messages),
-        "periods": periods,
+        "members": members, "record_columns": ["role", "speaker", "time", "text"], "periods": periods,
     }
     return (
         "按时段分析下面的记录。数量和时间已确定，不要修改；长记录已截断，密集时段已均匀抽样。\n"
+        "records 的每条数组按 record_columns 对应各列；speaker 对应 members 中的成员信息。\n"
         "各时段 summary 概括目标成员说了什么，context 概括邻近讨论的前因后果；"
         "无法确定关联时直接说明。quote 可留空，否则必须逐字摘自该时段目标成员的本次发言，最多 80 字。\n"
         + ("这是时段详情：详细交代讨论起因、表达、回应和结果；summary 和 context 各最多 450 字。\n" if report.detailed
@@ -348,7 +357,7 @@ class PersonalReportRenderer(ReportRenderer):
         output_dir = Path(tempfile.gettempdir()) / "astrbot_group_summary"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"personal_{dt.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
-        self.image.crop((0, 0, self.WIDTH, self.y + self.MARGIN)).save(output_path, format="PNG", optimize=True)
+        self.image.crop((0, 0, self.WIDTH, self.y + self.MARGIN)).save(output_path, format="PNG", compress_level=3)
         return output_path
 
 

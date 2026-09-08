@@ -594,29 +594,37 @@ class ReportRenderer:
     def _wrap(self, text: str, font, width: int, max_lines: int | None = None) -> list[str]:
         paragraphs = str(text or "").replace("\r", "").split("\n")
         lines: list[str] = []
-        for paragraph in paragraphs:
+        for paragraph_index, paragraph in enumerate(paragraphs):
             if not paragraph:
                 lines.append("")
-                continue
-            current = ""
-            for char in paragraph:
-                candidate = current + char
-                if self.draw.textlength(candidate, font=font) <= width:
-                    current = candidate
-                    continue
-                if current:
-                    lines.append(current)
-                    if max_lines and len(lines) >= max_lines:
-                        lines[-1] = lines[-1].rstrip("。；，,. ") + "..."
-                        return lines
-                current = char
-            if current:
-                lines.append(current)
-            if max_lines and len(lines) >= max_lines:
-                lines = lines[:max_lines]
-                if paragraphs[-1] != paragraph:
-                    lines[-1] = lines[-1].rstrip("。；，,. ") + "..."
-                return lines
+                if max_lines and len(lines) >= max_lines:
+                    return lines
+            offset = 0
+            while offset < len(paragraph):
+                # Measure whole prefixes with exponential bounds and binary search.
+                # This preserves font kerning without measuring every character prefix.
+                lower, upper = 0, min(64, len(paragraph) - offset)
+                while self.draw.textlength(paragraph[offset:offset + upper], font=font) <= width:
+                    lower = upper
+                    if offset + upper == len(paragraph):
+                        break
+                    upper = min(upper * 2, len(paragraph) - offset)
+                while lower < upper:
+                    middle = (lower + upper + 1) // 2
+                    if self.draw.textlength(paragraph[offset:offset + middle], font=font) <= width:
+                        lower = middle
+                    else:
+                        upper = middle - 1
+                length = max(1, lower)
+                lines.append(paragraph[offset:offset + length])
+                offset += length
+                if max_lines and len(lines) >= max_lines:
+                    if offset < len(paragraph) or paragraph_index < len(paragraphs) - 1:
+                        tail = lines[-1].rstrip("。；，,. ")
+                        while tail and self.draw.textlength(tail + "...", font=font) > width:
+                            tail = tail[:-1]
+                        lines[-1] = tail + "..."
+                    return lines
         return lines or [""]
 
     def _draw_lines(self, x: int, y: int, lines: list[str], font, fill: str, line_gap: int = 4) -> int:
@@ -830,7 +838,7 @@ class ReportRenderer:
         output_dir = Path(tempfile.gettempdir()) / "astrbot_group_summary"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"report_{stats.target_date.isoformat()}_{dt.datetime.now().strftime('%H%M%S_%f')}.png"
-        cropped.save(output_path, format="PNG", optimize=True)
+        cropped.save(output_path, format="PNG", compress_level=3)
         return output_path
 
 

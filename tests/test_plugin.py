@@ -28,6 +28,9 @@ def install_astrbot_stubs() -> None:
         def warning(self, *args, **kwargs) -> None:
             pass
 
+        def info(self, *args, **kwargs) -> None:
+            pass
+
     class Filters:
         class EventMessageType:
             ALL = "all"

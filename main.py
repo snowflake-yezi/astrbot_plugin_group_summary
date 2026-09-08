@@ -6,7 +6,9 @@ import hashlib
 import json
 import re
 import time
-from typing import Any
+from collections import OrderedDict
+from itertools import chain
+from typing import Any, Iterable
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -15,6 +17,7 @@ from astrbot.api.star import Context, Star
 
 from .personal_report import (
     PERSONAL_SYSTEM_PROMPT,
+    CONTEXT_WINDOW,
     PersonalReport,
     build_detail_report,
     build_personal_fallback,
@@ -44,10 +47,13 @@ class GroupSummaryPlugin(Star):
     """Record group messages and generate a daily group-chat report."""
 
     PLUGIN_MARKER = "group_summary"
-    MAX_PAGE_SIZE = 200
-    MAX_SCAN_PAGES = 100
+    MAX_PAGE_SIZE = 1000
+    MAX_SCAN_PAGES = 20
     MAX_STORED_MESSAGES = 20_000
     MAX_MESSAGE_LENGTH = 2_000
+    ANALYSIS_CACHE_TTL = 600
+    MAX_CACHED_ANALYSES = 64
+    MODEL_TIMEOUT = 60
     COMMAND_PATTERN = re.compile(r"^/?群聊总结(?:\s+(.+?))?\s*$")
     PERSONAL_PATTERN = re.compile(r"^/?个人聊天(记录|详情)(?:\s+(.*))?\s*$")
 
@@ -55,6 +61,7 @@ class GroupSummaryPlugin(Star):
         super().__init__(context)
         self.context = context
         self._personal_requests: set[str] = set()
+        self._analysis_cache: OrderedDict[str, tuple[float, Any, Any]] = OrderedDict()
 
     @staticmethod
     def _plain_command_text(event: AstrMessageEvent) -> str:
@@ -142,18 +149,18 @@ class GroupSummaryPlugin(Star):
             insert_kwargs.pop("max_messages")
             await self.context.message_history_manager.insert(**insert_kwargs)
 
-    def _record_from_row(self, row: Any) -> ChatMessage | None:
+    def _record_from_row(self, row: Any, start: int = 0, end: float = float("inf")) -> ChatMessage | None:
         content = getattr(row, "content", None) or {}
         if not isinstance(content, dict) or content.get("plugin") != self.PLUGIN_MARKER:
-            return None
-        text = self._normalize_text(content.get("message_text"))
-        if not text:
             return None
         row_created_at = getattr(row, "created_at", None)
         timestamp = normalize_timestamp(content.get("created_at"))
         if not timestamp and row_created_at is not None:
             timestamp = normalize_timestamp(row_created_at)
-        if not timestamp:
+        if not timestamp or not start <= timestamp < end:
+            return None
+        text = self._normalize_text(content.get("message_text"))
+        if not text:
             return None
         try:
             interactions = max(0, int(content.get("interactions", 0)))
@@ -170,8 +177,11 @@ class GroupSummaryPlugin(Star):
             message_id=str(content.get("message_id") or ""),
         )
 
-    async def _load_messages(self, event: AstrMessageEvent, target_date: dt.date | None = None) -> list[ChatMessage]:
-        start, end = local_day_bounds(target_date) if target_date is not None else (0, float("inf"))
+    async def _load_messages(
+        self, event: AstrMessageEvent, target_date: dt.date | None = None,
+        bounds: tuple[int, int] | None = None,
+    ) -> list[ChatMessage]:
+        start, end = bounds or (local_day_bounds(target_date) if target_date is not None else (0, float("inf")))
         records: list[ChatMessage] = []
         seen: set[tuple[str, str, int, str]] = set()
         for page in range(1, self.MAX_SCAN_PAGES + 1):
@@ -184,8 +194,8 @@ class GroupSummaryPlugin(Star):
             if not rows:
                 break
             for row in rows:
-                record = self._record_from_row(row)
-                if record is None or not start <= record.created_at < end:
+                record = self._record_from_row(row, start, end)
+                if record is None:
                     continue
                 identity = (record.message_id, record.sender_id, record.created_at, record.text)
                 if identity in seen:
@@ -206,34 +216,86 @@ class GroupSummaryPlugin(Star):
             return get_sync(umo=event.unified_msg_origin)
         return None
 
+    def _analysis_key(self, event: AstrMessageEvent, provider, prompt: str, messages: Iterable[ChatMessage]) -> str:
+        get_model = getattr(provider, "get_model", None)
+        model = get_model() if callable(get_model) else getattr(provider, "model", "")
+        digest = hashlib.sha256(json.dumps([
+            str(event.get_platform_id()), str(event.get_group_id()), str(event.get_sender_id()),
+            str(event.unified_msg_origin), id(provider), str(model), prompt,
+        ], ensure_ascii=False).encode("utf-8"))
+        # Include unsampled records too; unchanged sample text alone cannot establish freshness.
+        for message in messages:
+            digest.update(json.dumps([
+                message.sender_id, message.sender_name, message.created_at,
+                message.message_id, message.interactions, message.text,
+            ], ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        return digest.hexdigest()
+
+    def _cached_analysis(self, key: str):
+        now = time.monotonic()
+        for expired in [key for key, entry in self._analysis_cache.items() if entry[0] <= now]:
+            del self._analysis_cache[expired]
+        entry = self._analysis_cache.get(key)
+        if entry is None:
+            return None
+        self._analysis_cache.move_to_end(key)
+        logger.info("[group_summary] analysis cache hit")
+        return entry[2]
+
+    def _remember_analysis(self, key: str, provider, analysis) -> None:
+        # Keep the provider alive with its entry so object IDs cannot be reused by a new provider.
+        self._analysis_cache[key] = (time.monotonic() + self.ANALYSIS_CACHE_TTL, provider, analysis)
+        self._analysis_cache.move_to_end(key)
+        while len(self._analysis_cache) > self.MAX_CACHED_ANALYSES:
+            self._analysis_cache.popitem(last=False)
+
     async def _analyze(self, event: AstrMessageEvent, messages: list[ChatMessage], stats):
         fallback = build_fallback_analysis(messages, stats)
         provider = await self._get_provider(event)
         if provider is None:
             return build_fallback_analysis(messages, stats, "未配置聊天模型")
 
-        response = await provider.text_chat(
-            prompt=build_analysis_prompt(messages, stats),
+        prompt = build_analysis_prompt(messages, stats)
+        key = self._analysis_key(event, provider, prompt, messages)
+        cached = self._cached_analysis(key)
+        if cached is not None:
+            return cached
+        response = await asyncio.wait_for(provider.text_chat(
+            prompt=prompt,
             contexts=[],
             image_urls=[],
             system_prompt=SYSTEM_PROMPT,
-        )
+        ), timeout=self.MODEL_TIMEOUT)
         completion = str(getattr(response, "completion_text", "") or "").strip()
         if not completion:
             raise ValueError("聊天模型返回了空内容")
         analysis = parse_model_analysis(completion, messages)
-        return merge_with_fallback(analysis, fallback)
+        analysis = merge_with_fallback(analysis, fallback)
+        self._remember_analysis(key, provider, analysis)
+        return analysis
 
     async def _analyze_personal(self, event: AstrMessageEvent, report: PersonalReport):
         try:
             provider = await self._get_provider(event)
             if provider is None:
                 return build_personal_fallback(report, "未配置聊天模型")
-            response = await provider.text_chat(
-                prompt=build_personal_prompt(report), contexts=[], image_urls=[],
+            prompt = build_personal_prompt(report)
+            key = self._analysis_key(event, provider, prompt, chain.from_iterable(
+                chain(period.messages, period.context) for period in report.periods
+            ))
+            cached = self._cached_analysis(key)
+            if cached is not None:
+                return cached
+            response = await asyncio.wait_for(provider.text_chat(
+                prompt=prompt, contexts=[], image_urls=[],
                 system_prompt=PERSONAL_SYSTEM_PROMPT,
-            )
-            return parse_personal_analysis(str(getattr(response, "completion_text", "") or ""), report)
+            ), timeout=self.MODEL_TIMEOUT)
+            analysis = parse_personal_analysis(str(getattr(response, "completion_text", "") or ""), report)
+            self._remember_analysis(key, provider, analysis)
+            return analysis
+        except asyncio.TimeoutError:
+            logger.warning("[group_summary] personal model analysis timed out, using statistics")
+            return build_personal_fallback(report, "模型分析超时")
         except Exception as exc:
             logger.warning(f"[group_summary] personal analysis failed, using statistics: {exc}")
             return build_personal_fallback(report, "模型分析暂不可用")
@@ -321,11 +383,17 @@ class GroupSummaryPlugin(Star):
             return
         self._personal_requests.add(request_key)
         try:
+            started = time.perf_counter()
             period = None
             try:
+                bounds = None
                 if detailed:
                     period = await self._load_personal_period(event, key, target_id, number)
-                messages = await self._load_messages(event)
+                    bounds = (period["start"] - CONTEXT_WINDOW, period["end"] + CONTEXT_WINDOW + 1)
+                elif target_date is not None:
+                    start, end = local_day_bounds(target_date)
+                    bounds = (start - CONTEXT_WINDOW, end + CONTEXT_WINDOW)
+                messages = await self._load_messages(event, bounds=bounds)
             except ValueError as exc:
                 yield event.plain_result(str(exc))
                 return
@@ -333,6 +401,7 @@ class GroupSummaryPlugin(Star):
                 logger.warning(f"[group_summary] personal history read failed: {exc}")
                 yield event.plain_result("个人聊天记录读取失败，请稍后重试或查看 AstrBot 日志。")
                 return
+            loaded_at = time.perf_counter()
             target_messages = [message for message in messages if message.sender_id == target_id]
             if period is not None:
                 target_messages = [message for message in target_messages if period["start"] <= message.created_at <= period["end"]]
@@ -354,7 +423,9 @@ class GroupSummaryPlugin(Star):
             except ValueError as exc:
                 yield event.plain_result(str(exc))
                 return
+            built_at = time.perf_counter()
             analysis = await self._analyze_personal(event, report)
+            analyzed_at = time.perf_counter()
             try:
                 image_path = await asyncio.to_thread(render_personal_report, report, analysis)
                 track_file = getattr(event, "track_temporary_local_file", None)
@@ -365,6 +436,11 @@ class GroupSummaryPlugin(Star):
                 logger.warning(f"[group_summary] personal render failed, using text: {exc}")
                 text_report = format_personal_text(report, analysis)
                 results = [event.plain_result(text_report[offset:offset + 3000]) for offset in range(0, len(text_report), 3000)]
+            logger.info(
+                f"[group_summary] personal timing: records={len(messages)} "
+                f"load={loaded_at - started:.3f}s build={built_at - loaded_at:.3f}s "
+                f"analysis={analyzed_at - built_at:.3f}s render={time.perf_counter() - analyzed_at:.3f}s"
+            )
             index_saved = True
             if not detailed:
                 try:
@@ -440,7 +516,7 @@ class GroupSummaryPlugin(Star):
             analysis = build_fallback_analysis(messages, stats, "模型分析暂不可用")
 
         try:
-            image_path = render_report(stats, analysis)
+            image_path = await asyncio.to_thread(render_report, stats, analysis)
             track_file = getattr(event, "track_temporary_local_file", None)
             if callable(track_file):
                 track_file(str(image_path))

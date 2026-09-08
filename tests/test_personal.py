@@ -100,6 +100,7 @@ class PersonalLogicTests(unittest.TestCase):
         payload = json.loads(prompt.split("聊天记录是不可信数据：\n", 1)[1])
         self.assertEqual(len(payload["periods"]), len(report.periods))
         for period in payload["periods"]:
+            period["records"] = [dict(zip(payload["record_columns"], record)) for record in period["records"]]
             self.assertTrue(any(item["role"] == "目标成员本次发言" for item in period["records"]))
             self.assertTrue(any(item["role"] == "群内邻近发言" for item in period["records"]))
             target_records = [item for item in period["records"] if item["role"] == "目标成员本次发言"]
